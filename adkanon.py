@@ -1,134 +1,110 @@
+import glob
 import os
-import random
 import shutil
 import traceback
 from datetime import datetime
-from typing import Optional
+from typing import List
 
-import cv2
-import numpy as np
-from PIL import Image
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
+from fawkes.protection import Fawkes  # noqa: E402
 
 
 LOG_PREFIX = "[LOG {timestamp}] {message}"
+ALLOWED_EXTENSIONS = (".jpg", ".jpeg", ".png")
+DEFAULT_MODE = os.environ.get("ADKANON_MODE", "low")
+DEFAULT_BATCH_SIZE = int(os.environ.get("ADKANON_BATCH_SIZE", "1"))
+DEFAULT_FORMAT = os.environ.get("ADKANON_OUTPUT_FORMAT", "png").lower()
+FEATURE_EXTRACTOR = os.environ.get("ADKANON_EXTRACTOR", "extractor_2")
 
 
 def log(message: str) -> None:
-    print(LOG_PREFIX.format(timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message=message), flush=True)
+    print(
+        LOG_PREFIX.format(
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            message=message,
+        ),
+        flush=True,
+    )
 
 
-def strip_metadata(source_path: str, temp_path: str) -> bool:
-    """Re-save the image without EXIF metadata."""
-    try:
-        with Image.open(source_path) as img:
-            img.convert("RGB").save(temp_path, format="JPEG", quality=95)
-        log(f"Metadata stripped for {os.path.basename(source_path)}")
-        return True
-    except Exception as exc:
-        log(f"Failed to strip metadata for {source_path}: {exc}")
-        log(traceback.format_exc())
-        return False
+def _normalized_format(fmt: str) -> str:
+    fmt = fmt.lower().strip()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in {"png", "jpeg"}:
+        log(f"Unsupported format '{fmt}', defaulting to png")
+        fmt = "png"
+    return fmt
 
 
-def _pixelate(image: np.ndarray, factor: int = 12) -> np.ndarray:
-    h, w = image.shape[:2]
-    factor = max(2, min(factor, min(h, w) // 4 or 2))
-    temp = cv2.resize(image, (w // factor, h // factor), interpolation=cv2.INTER_LINEAR)
-    pixelated = cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
-    return pixelated
+OUTPUT_FORMAT = _normalized_format(DEFAULT_FORMAT)
 
 
-def _apply_random_masks(image: np.ndarray, overlays: int = 5) -> np.ndarray:
-    mask = image.copy()
-    h, w = mask.shape[:2]
-    for _ in range(overlays):
-        top_left = (random.randint(0, w - 1), random.randint(0, h - 1))
-        size_w = random.randint(w // 10, w // 3)
-        size_h = random.randint(h // 10, h // 3)
-        bottom_right = (
-            min(w - 1, top_left[0] + size_w),
-            min(h - 1, top_left[1] + size_h),
-        )
-        color = [random.randint(0, 255) for _ in range(3)]
-        alpha = random.uniform(0.35, 0.7)
-        sub = mask[top_left[1] : bottom_right[1], top_left[0] : bottom_right[0]]
-        if sub.size == 0:
-            continue
-        overlay = np.zeros_like(sub, dtype=np.uint8)
-        overlay[:] = color
-        cv2.addWeighted(overlay, alpha, sub, 1 - alpha, 0, dst=sub)
-    return mask
-
-
-def _add_noise(image: np.ndarray, sigma: float = 18.0) -> np.ndarray:
-    noise = np.random.normal(0, sigma, image.shape).astype(np.float32)
-    noisy = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    return noisy
-
-
-def _apply_mixed_anonymization(image: np.ndarray) -> np.ndarray:
-    log("Applying anonymization pipeline")
-    pixel_factor = random.randint(8, 18)
-    log(f"Pixelation factor selected: {pixel_factor}")
-    anonymized = _pixelate(image, factor=pixel_factor)
-
-    anonymized = _add_noise(anonymized, sigma=random.uniform(10, 22))
-    log("Noise overlay applied")
-
-    anonymized = _apply_random_masks(anonymized, overlays=random.randint(3, 6))
-    log("Random obfuscation masks applied")
-
-    blur_kernel = random.choice([(11, 11), (15, 15)])
-    anonymized = cv2.GaussianBlur(anonymized, blur_kernel, sigmaX=0)
-    log(f"Gaussian blur applied with kernel {blur_kernel}")
-
-    return anonymized
-
-
-def anonymize_image(source_path: str, destination_path: str) -> bool:
-    log(f"Processing {source_path}")
-    temp_path = destination_path + ".tmp"
-    if not strip_metadata(source_path, temp_path):
-        return False
-
-    image = cv2.imread(temp_path)
-    if image is None:
-        log(f"Failed to read image {temp_path}")
-        return False
-
-    anonymized = _apply_mixed_anonymization(image)
-
-    try:
-        cv2.imwrite(destination_path, anonymized, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        log(f"Anonymized image saved to {destination_path}")
-        return True
-    except Exception as exc:
-        log(f"Failed to write anonymized image {destination_path}: {exc}")
-        log(traceback.format_exc())
-        return False
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            log(f"Temporary file cleaned: {temp_path}")
+def _gather_image_paths(directory: str) -> List[str]:
+    matched: List[str] = []
+    for entry in sorted(glob.glob(os.path.join(directory, "*"))):
+        if entry.lower().endswith(ALLOWED_EXTENSIONS) and os.path.isfile(entry):
+            matched.append(entry)
+    return matched
 
 
 def process_batch(input_dir: str, output_dir: str) -> bool:
-    success = True
     os.makedirs(output_dir, exist_ok=True)
-    entries = [f for f in sorted(os.listdir(input_dir)) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    if not entries:
-        log("No compatible images found for anonymization")
+    image_paths = _gather_image_paths(input_dir)
+    if not image_paths:
+        log("No compatible images found; skipping Fawkes run")
         return False
 
-    for filename in entries:
-        source_path = os.path.join(input_dir, filename)
-        basename = os.path.splitext(filename)[0]
-        destination_path = os.path.join(
-            output_dir,
-            f"anon_{basename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random.randint(1000, 9999)}.jpg",
+    try:
+        log(
+            "Launching Fawkes cloaking (mode={mode}, batch_size={batch}, format={fmt}, extractor={extractor})".format(
+                mode=DEFAULT_MODE,
+                batch=DEFAULT_BATCH_SIZE,
+                fmt=OUTPUT_FORMAT,
+                extractor=FEATURE_EXTRACTOR,
+            )
         )
-        if not anonymize_image(source_path, destination_path):
+        protector = Fawkes(
+            feature_extractor=FEATURE_EXTRACTOR,
+            gpu=None,
+            batch_size=DEFAULT_BATCH_SIZE,
+            mode=DEFAULT_MODE,
+        )
+        status = protector.run_protection(
+            image_paths,
+            batch_size=DEFAULT_BATCH_SIZE,
+            format=OUTPUT_FORMAT,
+            separate_target=False,
+            debug=False,
+            no_align=False,
+            save_last_on_failed=True,
+        )
+    except Exception as exc:
+        log(f"Fawkes execution failed: {exc}")
+        log(traceback.format_exc())
+        return False
+
+    if status != 1:
+        status_map = {
+            2: "No face detected in supplied images",
+            3: "No images available for processing",
+        }
+        log(status_map.get(status, f"Fawkes returned non-success status code {status}"))
+        return False
+
+    success = True
+    for src_path in image_paths:
+        cloaked_path = f"{os.path.splitext(src_path)[0]}_cloaked.{OUTPUT_FORMAT}"
+        if not os.path.exists(cloaked_path):
+            log(f"Expected cloaked file missing: {cloaked_path}")
             success = False
+            continue
+        destination = os.path.join(output_dir, os.path.basename(cloaked_path))
+        shutil.move(cloaked_path, destination)
+        log(f"Generated cloaked image: {destination}")
+
     return success
 
 
@@ -140,10 +116,9 @@ if __name__ == "__main__":
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    log("ADKAnon batch anonymizer started")
-    batch_success = process_batch(input_dir, output_dir)
-    if not batch_success:
-        log("Anonymization completed with errors")
+    log("ADKAnon Fawkes batch start")
+    if not process_batch(input_dir, output_dir):
+        log("Fawkes cloaking completed with errors")
         exit(1)
 
-    log("Anonymization complete")
+    log("Fawkes cloaking complete")

@@ -1,13 +1,13 @@
 # ADKAnon API
 
-ADKAnon is a lightweight anonymization microservice inspired by the Fawkes API wrapper. It accepts a batch of four images, applies destructive anonymization transforms, and returns the processed files as a ZIP archive. The service is designed to run on Railway and integrates cleanly with Lovable creator tools.
+ADKAnon is a dedicated wrapper around the official [Fawkes](https://sandlab.cs.uchicago.edu/fawkes) cloaking library. It accepts a batch of four face images, runs them through Fawkes to generate cloaked variants that poison facial-recognition models, and returns the processed files as a ZIP archive. The service is designed to run on Railway and integrates cleanly with Lovable creator tools.
 
 ## Features
 
 - Flask API with `/api/anon` endpoint protected by `x-api-key`
 - Batch processing of exactly four images per request
-- Image metadata removal, pixelation, noise, and randomized overlays for anonymization
-- Zip archive response
+- True Fawkes cloaking (low mode by default, ArcFace extractor_2) executed via the upstream library
+- Zip archive response containing the `*_cloaked` images produced by Fawkes
 - Structured logging emitted directly from the processing pipeline for observability
 
 ## Quick start
@@ -43,7 +43,13 @@ ADKAnon is a lightweight anonymization microservice inspired by the Fawkes API w
 - Commit the repository.
 - Create a new Railway project pointing at the repo.
 - Set the environment variable `ADKANON_API_KEY`.
+- *(Optional)* Tune Fawkes via environment variables:
+  - `ADKANON_MODE` (`low`, `mid`, `high`) – defaults to `low`
+  - `ADKANON_BATCH_SIZE` – defaults to `1`
+  - `ADKANON_OUTPUT_FORMAT` (`png` or `jpeg`) – defaults to `png`
+  - `ADKANON_EXTRACTOR` (`extractor_2` or `extractor_0`) – defaults to `extractor_2`
 - Deploy; Railway will install Python dependencies and start Gunicorn via the `Procfile`.
+- On the first run Fawkes will download its ArcFace model weights (~100 MB) to the container; leave the service running until the download completes.
 
 ## Lovable integration hints
 
@@ -54,4 +60,4 @@ ADKAnon is a lightweight anonymization microservice inspired by the Fawkes API w
 
 ## Logging
 
-The anonymization script logs each major step. These logs are printed to STDOUT by the API wrapper, making them visible inside Railway's live logs for observability.
+The Fawkes runner logs each major step (`[LOG …]` lines) and the API wrapper forwards stdout/stderr to Railway. Use `railway logs` to observe the cloaking pipeline and diagnose missing-face scenarios.
