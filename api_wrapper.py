@@ -1,13 +1,13 @@
-import io
+import base64
+import mimetypes
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import zipfile
 from typing import List
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request
 from werkzeug.utils import secure_filename
 
 api_bp = Blueprint("api", __name__)
@@ -98,18 +98,17 @@ def run_batch():
                 "details": f"Expected {REQUIRED_FILE_COUNT} files, found {len(produced)}",
             }), 500
 
-        memory_file = io.BytesIO()
-        with zipfile.ZipFile(memory_file, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
-            for file_path in produced:
-                arcname = os.path.basename(file_path)
-                bundle.write(file_path, arcname)
-        memory_file.seek(0)
+        payload = []
+        for file_path in sorted(produced):
+            with open(file_path, "rb") as fh:
+                encoded = base64.b64encode(fh.read()).decode("ascii")
+            mime_type, _ = mimetypes.guess_type(file_path)
+            payload.append({
+                "filename": os.path.basename(file_path),
+                "content_type": mime_type or "application/octet-stream",
+                "data": encoded,
+            })
 
-        return send_file(
-            memory_file,
-            as_attachment=True,
-            download_name="anon.zip",
-            mimetype="application/zip",
-        )
+        return jsonify({"files": payload})
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)

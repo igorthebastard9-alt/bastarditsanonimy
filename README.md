@@ -1,13 +1,13 @@
 # ADKAnon API
 
-ADKAnon is a dedicated wrapper around the official [Fawkes](https://sandlab.cs.uchicago.edu/fawkes) cloaking library. It accepts a batch of four face images, runs them through Fawkes to generate cloaked variants that poison facial-recognition models, and returns the processed files as a ZIP archive. The service is designed to run on Railway and integrates cleanly with Lovable creator tools.
+ADKAnon is a dedicated wrapper around the official [Fawkes](https://sandlab.cs.uchicago.edu/fawkes) cloaking library. It accepts a batch of four face images, runs them through Fawkes to generate cloaked variants that poison facial-recognition models, and returns the processed files inline as base64-encoded JSON. The service is designed to run on Railway and integrates cleanly with Lovable creator tools.
 
 ## Features
 
 - Flask API with `/api/anon` endpoint protected by `x-api-key`
 - Batch processing of exactly four images per request
 - True Fawkes cloaking (low mode by default, ArcFace extractor_2) executed via the upstream library
-- Zip archive response containing the `*_cloaked` images produced by Fawkes
+- JSON response containing the `*_cloaked` images (base64-encoded payloads) produced by Fawkes
 - Structured logging emitted directly from the processing pipeline for observability
 
 ## Quick start
@@ -29,14 +29,15 @@ ADKAnon is a dedicated wrapper around the official [Fawkes](https://sandlab.cs.u
 
 4. **Call the endpoint**
    ```bash
-   curl -X POST \
+   curl -s -X POST \
         -H "x-api-key: your-secret" \
         -F "files=@image1.jpg" \
         -F "files=@image2.jpg" \
         -F "files=@image3.jpg" \
         -F "files=@image4.jpg" \
-        http://127.0.0.1:5000/api/anon --output anon.zip
+        http://127.0.0.1:5000/api/anon | jq '.files[] | {filename, content_type, data:.data[:32]}'
    ```
+   (Each entry in the `files` array contains `filename`, `content_type`, and base64 `data` fields.)
 
 ## Deployment on Railway
 
@@ -56,7 +57,7 @@ ADKAnon is a dedicated wrapper around the official [Fawkes](https://sandlab.cs.u
 - Base URL: your Railway domain (e.g. `https://adkanon.up.railway.app`).
 - Endpoint: `POST /api/anon` with `multipart/form-data` field `files` provided exactly four times.
 - Authentication: `x-api-key: ${ADKANON_API_KEY}` stored as a Lovable secret.
-- Response: ZIP binary; configure Lovable to surface or download the returned archive.
+- Response: JSON array of cloaked images (`files` field). Decode each entry's base64 string to save the processed image individually.
 
 ## Logging
 
