@@ -5,6 +5,12 @@ from api_wrapper import api_bp
 app = Flask(__name__)
 app.register_blueprint(api_bp)
 
+try:
+    import cv2  # noqa: F401
+    print(f"[BOOT] cv2 module path: {cv2.__file__}", flush=True)
+except Exception as exc:
+    print(f"[BOOT] Unable to import cv2: {exc}", flush=True)
+
 
 @app.route("/")
 def index():
