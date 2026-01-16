@@ -12,6 +12,19 @@ except Exception as exc:
     print(f"[BOOT] Unable to import cv2: {exc}", flush=True)
 
 
+@app.errorhandler(Exception)
+def handle_unexpected_error(err):
+    import traceback
+
+    print("[ERROR] Unhandled exception:", flush=True)
+    traceback.print_exc()
+    return jsonify({
+        "success": False,
+        "error": str(err),
+        "type": err.__class__.__name__,
+    }), 500
+
+
 @app.route("/")
 def index():
     return jsonify({
@@ -19,6 +32,7 @@ def index():
         "endpoints": {
             "health": "/health",
             "batch": "POST /api/anon",
+            "status": "GET /api/status/<job_id>",
         },
     })
 
