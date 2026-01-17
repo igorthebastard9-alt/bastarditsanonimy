@@ -19,10 +19,17 @@ from werkzeug.utils import secure_filename
 api_bp = Blueprint("api", __name__)
 
 
-REQUIRED_FILE_COUNT = 4
 LOG_CHAR_LIMIT = 10_000
 JOB_TTL_SECONDS = 30 * 60
 CLEANUP_INTERVAL_SECONDS = 60
+
+# This service now treats each request as a single-image job. Earlier versions tried to
+# anonymize four images in one batch and infer progress by parsing TensorFlow/Keras stdout.
+# That approach proved unreliable because library logs are noisy and can change across
+# releases. Parsing stdout to drive state transitions also risked deadlocks and races.
+# The refactored design launches exactly one subprocess per image and derives job status
+# only from the process lifecycle and the presence of the expected output file; stdout is
+# kept purely for debugging, never for correctness.
 
 _jobs: Dict[str, Dict[str, object]] = {}
 _jobs_lock = threading.Lock()
@@ -86,7 +93,7 @@ def _format_time(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds") + "Z"
 
 
-def _create_job(job_dir: str, total_files: int) -> str:
+def _create_job(job_dir: str) -> str:
     job_id = uuid.uuid4().hex
     now = _now()
     with _jobs_lock:
@@ -96,12 +103,12 @@ def _create_job(job_dir: str, total_files: int) -> str:
             "created_at": now,
             "updated_at": now,
             "last_heartbeat": now,
+            "completed_at": None,
             "logs": [],
             "log_chars": 0,
             "error": None,
-            "output_files": None,
+            "output": None,
             "job_dir": job_dir,
-            "progress": {"total": total_files, "done": 0},
         }
     _ensure_cleanup_thread()
     return job_id
@@ -160,7 +167,7 @@ def _append_log(job_id: str, message: str) -> None:
     print(f"[JOB {job_id}] {message}", flush=True)
 
 
-def _update_job(job_id: str, *, status: Optional[str] = None, error: Optional[str] = None, output_files: Optional[List[dict]] = None, progress_done: Optional[int] = None) -> None:
+def _update_job(job_id: str, *, status: Optional[str] = None, error: Optional[str] = None, output: Optional[dict] = None) -> None:
     with _jobs_lock:
         job = _jobs.get(job_id)
         if job is None:
@@ -170,10 +177,8 @@ def _update_job(job_id: str, *, status: Optional[str] = None, error: Optional[st
             job["status"] = status
         if error is not None:
             job["error"] = error
-        if output_files is not None:
-            job["output_files"] = output_files
-        if progress_done is not None:
-            job.setdefault("progress", {})["done"] = progress_done
+        if output is not None:
+            job["output"] = output
         job["updated_at"] = now
         job["last_heartbeat"] = now
         if job.get("status") in {"succeeded", "failed"}:
@@ -195,7 +200,6 @@ def _serialize_job(job: Dict[str, object]) -> Dict[str, object]:
         "success": job.get("status") == "succeeded",
         "job_id": job.get("job_id"),
         "status": job.get("status"),
-        "progress": job.get("progress", {"total": 0, "done": 0}),
         "created_at": _format_time(created_at if isinstance(created_at, datetime) else _now()),
         "updated_at": _format_time(updated_at if isinstance(updated_at, datetime) else _now()),
         "logs": job.get("logs", []),
@@ -205,8 +209,8 @@ def _serialize_job(job: Dict[str, object]) -> Dict[str, object]:
         response["completed_at"] = _format_time(completed_at if isinstance(completed_at, datetime) else _now())
     if job.get("error"):
         response["error"] = job.get("error")
-    if job.get("status") == "succeeded" and job.get("output_files"):
-        response["files"] = job.get("output_files")
+    if job.get("status") == "succeeded" and job.get("output"):
+        response["file"] = job.get("output")
     return response
 
 
@@ -224,20 +228,16 @@ def _stream_reader(job_id: str, pipe, prefix: str) -> None:
         with pipe:
             for line in pipe:
                 _append_log(job_id, f"{prefix}: {line.rstrip()}")
-                if prefix == "STDOUT" and "Image saved to" in line:
-                    # heuristic to bump progress when Fawkes logs saved image
-                    current = _get_job(job_id)
-                    if current:
-                        done = current.get("progress", {}).get("done", 0)
-                        total = current.get("progress", {}).get("total", 0)
-                        if done < total:
-                            _update_job(job_id, progress_done=done + 1)
     except Exception as exc:  # noqa: BLE001
         _append_log(job_id, f"{prefix} reader error: {exc}")
 
 
 def _execute_job(job_id: str, job_dir: str, job_input: str, job_output: str) -> None:
-    _update_job(job_id, status="running", progress_done=0)
+    """Run Fawkes on a single image in the background.
+
+    We deliberately avoid any stdout-based progress heuristics; job status depends solely on
+    the subprocess exit code and whether exactly one output file was produced."""
+    _update_job(job_id, status="running")
     _append_log(job_id, "Job started")
     _append_log(job_id, "Starting Fawkes subprocess")
     script_path = _script_path()
@@ -280,34 +280,38 @@ def _execute_job(job_id: str, job_dir: str, job_input: str, job_output: str) -> 
         produced = []
         for root, _, files in os.walk(job_output):
             for file_name in files:
-                produced.append(os.path.join(root, file_name))
-        done_count = len(produced)
-        _update_job(job_id, progress_done=done_count)
-        if done_count != REQUIRED_FILE_COUNT:
-            message = f"Expected {REQUIRED_FILE_COUNT} files, found {done_count}"
+                if file_name.lower().endswith((".jpg", ".jpeg", ".png")):
+                    produced.append(os.path.join(root, file_name))
+
+        if not produced:
+            message = "No output file produced"
+            _append_log(job_id, f"Job failed: {message}")
+            _update_job(job_id, status="failed", error=message)
+            return
+        if len(produced) > 1:
+            message = f"Expected 1 output file, found {len(produced)}"
             _append_log(job_id, f"Job failed: {message}")
             _update_job(job_id, status="failed", error=message)
             return
 
-        payload = []
-        for file_path in sorted(produced):
-            try:
-                with open(file_path, "rb") as fh:
-                    encoded = base64.b64encode(fh.read()).decode("ascii")
-                mime_type, _ = mimetypes.guess_type(file_path)
-                payload.append({
-                    "filename": os.path.basename(file_path),
-                    "content_type": mime_type or "application/octet-stream",
-                    "data": encoded,
-                })
-                _append_log(job_id, f"Prepared output file {os.path.basename(file_path)}")
-            except Exception as exc:  # noqa: BLE001
-                _append_log(job_id, f"Job failed: unable to read output {file_path}: {exc}")
-                _update_job(job_id, status="failed", error=str(exc))
-                return
+        output_path = produced[0]
+        try:
+            with open(output_path, "rb") as fh:
+                encoded = base64.b64encode(fh.read()).decode("ascii")
+            mime_type, _ = mimetypes.guess_type(output_path)
+            payload = {
+                "filename": os.path.basename(output_path),
+                "content_type": mime_type or "application/octet-stream",
+                "data": encoded,
+            }
+            _append_log(job_id, f"Prepared output file {os.path.basename(output_path)}")
+        except Exception as exc:  # noqa: BLE001
+            _append_log(job_id, f"Job failed: unable to read output {output_path}: {exc}")
+            _update_job(job_id, status="failed", error=str(exc))
+            return
 
         _append_log(job_id, "Job finished successfully")
-        _update_job(job_id, status="succeeded", output_files=payload, progress_done=REQUIRED_FILE_COUNT)
+        _update_job(job_id, status="succeeded", output=payload)
     except Exception as exc:  # noqa: BLE001
         import traceback
 
@@ -348,19 +352,20 @@ def job_status(job_id: str):
 
 @api_bp.route("/api/anon", methods=["POST"])
 def run_batch():
+    """Accept exactly one image, enqueue anonymization, and return a job id."""
     try:
         if not _verify_api_key():
             return jsonify({"success": False, "error": "Unauthorized"}), 401
 
         if "files" not in request.files:
-            return jsonify({"success": False, "error": "No files provided", "details": "Upload exactly 4 images using the 'files' field."}), 400
+            return jsonify({"success": False, "error": "No file provided", "details": "Upload exactly one image using the 'files' field."}), 400
 
         uploads: List = [f for f in request.files.getlist("files") if f and f.filename]
-        if len(uploads) != REQUIRED_FILE_COUNT:
+        if len(uploads) != 1:
             return jsonify({
                 "success": False,
                 "error": "Invalid file count",
-                "details": f"Provide exactly {REQUIRED_FILE_COUNT} files.",
+                "details": "Provide exactly one image per request.",
             }), 400
 
         job_dir = tempfile.mkdtemp(prefix="adkanon_job_")
@@ -369,17 +374,17 @@ def run_batch():
         os.makedirs(job_input, exist_ok=True)
         os.makedirs(job_output, exist_ok=True)
 
-        for upload in uploads:
-            filename = secure_filename(upload.filename) or "image.jpg"
-            destination = os.path.join(job_input, filename)
-            upload.save(destination)
+        upload = uploads[0]
+        filename = secure_filename(upload.filename) or "image.jpg"
+        destination = os.path.join(job_input, filename)
+        upload.save(destination)
 
         script_path = _script_path()
         if not os.path.exists(script_path):
             shutil.rmtree(job_dir, ignore_errors=True)
             return jsonify({"success": False, "error": "Processing script missing"}), 500
 
-        job_id = _create_job(job_dir, total_files=len(uploads))
+        job_id = _create_job(job_dir)
         _append_log(job_id, "Job enqueued; files saved")
 
         thread = threading.Thread(target=_execute_job, args=(job_id, job_dir, job_input, job_output), daemon=True)
@@ -389,7 +394,6 @@ def run_batch():
             "success": True,
             "job_id": job_id,
             "status": "queued",
-            "progress": {"total": len(uploads), "done": 0},
         })
     except Exception as exc:  # noqa: BLE001
         import traceback

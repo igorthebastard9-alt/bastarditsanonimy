@@ -3,6 +3,9 @@ import os
 os.environ.setdefault("HOME", "/app")
 os.environ.setdefault("KERAS_HOME", "/app/.keras")
 os.environ.setdefault("XDG_CACHE_HOME", "/app/.cache")
+# Each request is processed as an independent job (single image). Earlier revisions grouped
+# multiple images together, but that made error handling and retries unpredictable. The
+# refactored design keeps jobs deterministic and debuggable.
 os.makedirs(os.path.join(os.environ["KERAS_HOME"], "models"), exist_ok=True)
 os.makedirs(os.environ["XDG_CACHE_HOME"], exist_ok=True)
 
