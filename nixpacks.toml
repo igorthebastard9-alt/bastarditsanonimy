@@ -1,5 +1,8 @@
 [phases.install]
 cmds = [
-  "mkdir -p /app/models",
-  "curl -fL https://mirror.cs.uchicago.edu/fawkes/files/extractor_2.h5 -o /app/models/extractor_2.h5"
+  "python -m pip install --upgrade pip",
+  "pip install -r requirements.txt",
+  "mkdir -p /app/.keras/models /app/.cache",
+  "if [ ! -f /app/.keras/models/extractor_2.h5 ]; then curl -fL https://mirror.cs.uchicago.edu/fawkes/files/extractor_2.h5 -o /app/.keras/models/extractor_2.h5; fi",
+  "python -c \"import os; p='/app/.keras/models/extractor_2.h5'; print('MODEL_EXISTS', os.path.exists(p), 'SIZE', os.path.getsize(p) if os.path.exists(p) else 0)\""
 ]

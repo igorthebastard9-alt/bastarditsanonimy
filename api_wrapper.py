@@ -7,11 +7,11 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timedelta
+from importlib import resources as importlib_resources
 from typing import Dict, List, Optional
-
-import pkg_resources
 
 from flask import Blueprint, jsonify, request
 from werkzeug.utils import secure_filename
@@ -28,41 +28,54 @@ _jobs: Dict[str, Dict[str, object]] = {}
 _jobs_lock = threading.Lock()
 _cleanup_started = False
 
-MODELS_SOURCE_PATH = "/app/models/extractor_2.h5"
+MODEL_URL = "https://mirror.cs.uchicago.edu/fawkes/files/extractor_2.h5"
+MODEL_SIZE_BYTES = 161_829_576
+PRIMARY_MODEL_PATH = "/app/.keras/models/extractor_2.h5"
+
+
+def _file_ok(path: str) -> bool:
+    return os.path.exists(path) and os.path.getsize(path) == MODEL_SIZE_BYTES
 
 
 def ensure_model_weights() -> None:
     os.environ.setdefault("KERAS_HOME", "/app/.keras")
     os.environ.setdefault("XDG_CACHE_HOME", "/app/.cache")
-    os.makedirs("/app/.keras", exist_ok=True)
+    os.makedirs("/app/.keras/models", exist_ok=True)
     os.makedirs("/app/.cache", exist_ok=True)
-    source = MODELS_SOURCE_PATH
-    try:
-        target_dir = pkg_resources.resource_filename("fawkes", "model")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[BOOT] Unable to resolve fawkes model directory: {exc}", flush=True)
+
+    target_path = PRIMARY_MODEL_PATH
+    if _file_ok(target_path):
         return
-    os.makedirs(target_dir, exist_ok=True)
-    target_path = os.path.join(target_dir, "extractor_2.h5")
-    if os.path.exists(source):
-        try:
-            src_size = os.path.getsize(source)
-        except OSError as exc:
-            print(f"[BOOT] Unable to stat source model {source}: {exc}", flush=True)
-            return
-        try:
-            if not os.path.exists(target_path) or os.path.getsize(target_path) != src_size:
-                shutil.copy2(source, target_path)
-                print(f"[BOOT] Copied extractor weights to {target_path}", flush=True)
-            else:
-                print(f"[BOOT] Extractor weights already present at {target_path}", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[BOOT] Failed to copy model weights: {exc}", flush=True)
-    else:
-        print(f"[BOOT] Warning: extractor weights missing at {source}", flush=True)
 
+    print(f"[BOOT] extractor cache missing or invalid at {target_path}; downloading...", flush=True)
+    fd, temp_path = tempfile.mkstemp(prefix="extractor_2_", suffix=".h5", dir=os.path.dirname(target_path))
+    os.close(fd)
+    try:
+        with urllib.request.urlopen(MODEL_URL) as response, open(temp_path, "wb") as outfile:
+            shutil.copyfileobj(response, outfile)
+        if not _file_ok(temp_path):
+            raise ValueError("downloaded file size mismatch")
+        os.replace(temp_path, target_path)
+        print(f"[BOOT] extractor downloaded to {target_path}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        print(f"[BOOT] ERROR downloading extractor weights: {exc}", flush=True)
+        raise
 
-ensure_model_weights()
+    # Best-effort copy into fawkes package directory
+    try:
+        package_dir = importlib_resources.files("fawkes") / "model"
+        os.makedirs(package_dir, exist_ok=True)
+        package_target = package_dir / "extractor_2.h5"
+        if not package_target.exists() or package_target.stat().st_size != MODEL_SIZE_BYTES:
+            shutil.copy2(target_path, package_target)
+            print(f"[BOOT] extractor copied into {package_target}", flush=True)
+        else:
+            print(f"[BOOT] extractor already present in {package_target}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[BOOT] Warning: unable to copy weights into package directory: {exc}", flush=True)
+
 
 
 def _now() -> datetime:
