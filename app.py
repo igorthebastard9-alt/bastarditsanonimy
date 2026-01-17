@@ -1,6 +1,11 @@
+import os
+
+os.environ.setdefault("KERAS_HOME", "/app/.keras")
+os.environ.setdefault("XDG_CACHE_HOME", "/app/.cache")
+
 from flask import Flask, jsonify
 
-from api_wrapper import api_bp
+from api_wrapper import api_bp, MODELS_SOURCE_PATH, ensure_model_weights
 
 app = Flask(__name__)
 app.register_blueprint(api_bp)
@@ -10,6 +15,12 @@ try:
     print(f"[BOOT] cv2 module path: {cv2.__file__}", flush=True)
 except Exception as exc:
     print(f"[BOOT] Unable to import cv2: {exc}", flush=True)
+
+ensure_model_weights()
+if os.path.exists(MODELS_SOURCE_PATH):
+    print(f"[BOOT] Local extractor cache: {MODELS_SOURCE_PATH} ({os.path.getsize(MODELS_SOURCE_PATH)} bytes)", flush=True)
+else:
+    print(f"[BOOT] Local extractor cache missing at {MODELS_SOURCE_PATH}", flush=True)
 
 
 @app.errorhandler(Exception)

@@ -1,0 +1,5 @@
+[phases.install]
+cmds = [
+  "mkdir -p /app/models",
+  "curl -fL https://mirror.cs.uchicago.edu/fawkes/files/extractor_2.h5 -o /app/models/extractor_2.h5"
+]
